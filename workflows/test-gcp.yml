@@ -1,0 +1,24 @@
+name: Test Connexion GCP
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  verification:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Récupérer le code du projet
+      uses: actions/checkout@v4
+
+    - name: Connexion à Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Configurer les outils Google Cloud
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Tester une commande Google Cloud
+      run: gcloud info
