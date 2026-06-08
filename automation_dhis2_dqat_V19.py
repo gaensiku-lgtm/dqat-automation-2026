@@ -1,6 +1,6 @@
 # ==============================================================================
 # SCRIPT AUTOMATISÉ DQAT - VERSION 19 (MOTEUR DE NETTOYAGE MULTI-FEUILLES)
-# Configuration : Adaptée pour GitHub Actions (Variables d'environnement)
+# Configuration : GitHub Actions avec Sauvegarde Directe Google Drive API
 # Zone Horaire : Afrique/Kinshasa (UTC+1)
 # ==============================================================================
 
@@ -13,11 +13,19 @@ import requests
 import pandas as pd
 import urllib3
 
+# Importations pour l'API Google Drive
+import google.auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
 # Désactivation des alertes de sécurité SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration du fuseau horaire de Kinshasa (UTC+1)
 TZ_KINSHASA = timezone(timedelta(hours=1))
+
+# ID de votre dossier Google Drive partagé
+ID_DOSSIER_RACINE_DRIVE = "1RMriGUzLVa_O1Cf28OUPTlF2Jl0QEXn-"
 
 # Dictionnaire officiel des favoris validés (UID PEC actualisé)
 FAVORIS_MAPPING = {
@@ -28,36 +36,61 @@ FAVORIS_MAPPING = {
     "eU2NiPPtbKv": "Suivi FA (6 derniers mois)"
 }
 
-def initialiser_environnement():
+def initialiser_drive_service():
+    try:
+        # Authentification automatique via la clé GCP_SA_KEY configurée sur GitHub
+        creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
+        service = build('drive', 'v3', credentials=creds)
+        return service
+    except Exception as e:
+        print(f"[X] Erreur d'initialisation de l'API Google Drive : {str(e)}")
+        raise e
+
+def creer_dossier_drive(service, nom_dossier, parent_id):
+    metadata = {
+        'name': nom_dossier,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_id]
+    }
+    dossier = service.files().create(body=metadata, fields='id').execute()
+    return dossier.get('id')
+
+def uploader_fichier_drive(service, chemin_local, nom_fichier, dossier_destination_id):
+    metadata = {'name': nom_fichier, 'parents': [dossier_destination_id]}
+    
+    if chemin_local.endswith('.xlsx'):
+        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    elif chemin_local.endswith('.json'):
+        mime = 'application/json'
+    else:
+        mime = 'text/plain'
+        
+    media = MediaFileUpload(chemin_local, mimetype=mime, resumable=True)
+    service.files().create(body=metadata, media_body=media, fields='id').execute()
+    print(f"  [➔] Transféré sur Google Drive : {nom_fichier}")
+
+def initialiser_environnement_local():
     print("====================================================================")
     print("          LANCEMENT DU MOTEUR AUTOMATISÉ DQAT ONLINE - V19")
     print("====================================================================\n")
     
-    # Sur GitHub Actions, on crée un dossier local plutôt que de monter un Google Drive
-    chemin_racine = './DQAT_online'
-
-    if not os.path.exists(chemin_racine):
-        print(f"[!] Création du dossier de sortie : {chemin_racine}")
-        os.makedirs(chemin_racine, exist_ok=True)
-    else:
-        print(f"[+] Dossier de sortie détecté : {chemin_racine}")
-
+    chemin_racine = './DQAT_online_temp'
+    os.makedirs(chemin_racine, exist_ok=True)
+    
     nom_session = datetime.now(TZ_KINSHASA).strftime("Session_%Y-%m-%d_%Hh%Mm%Ss")
     chemin_destination = os.path.join(chemin_racine, nom_session)
     os.makedirs(chemin_destination, exist_ok=True)
-    print(f"[+] Dossier de stockage créé (Heure Kinshasa) : {nom_session}")
-    return chemin_destination
+    return chemin_destination, nom_session
 
 def recuperer_identifiants():
     try:
-        # Sur GitHub, on récupère les secrets via les variables d'environnement du système
         username = os.environ.get('DHIS2_USERG')
         password = os.environ.get('DHIS2_PASSWORDG')
         if not username or not password:
             raise ValueError("Les variables d'environnement sont vides.")
         return username, password
     except Exception as e:
-        print("\n[X] ERREUR : Clés 'DHIS2_USERG' ou 'DHIS2_PASSWORDG' introuvables dans les Secrets GitHub.\n")
+        print("\n[X] ERREUR : Clés 'DHIS2_USERG' ou 'DHIS2_PASSWORDG' introuvables.\n")
         raise e
 
 def recuperer_metadonnees_geo_ciblees(session, base_url, liste_uids, username, password):
@@ -69,7 +102,6 @@ def recuperer_metadonnees_geo_ciblees(session, base_url, liste_uids, username, p
     for i in range(0, len(liste_uids), taille_paquet):
         paquet = liste_uids[i:i+taille_paquet]
         filtre_ids = ",".join(paquet)
-
         url = f"{base_url}/api/organisationUnits.json?filter=id:in:[{filtre_ids}]&fields=id,name,level,ancestors[level,name]&paging=false"
         try:
             response = session.get(url, timeout=60, verify=False, auth=(username, password))
@@ -97,17 +129,16 @@ def recuperer_metadonnees_geo_ciblees(session, base_url, liste_uids, username, p
                     }
         except Exception:
             continue
-
     return mapping_geo
 
-def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password, dossier_destination):
+def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password, dossier_local, drive_service, id_session_drive):
     session = requests.Session()
     auth_str = f"{username}:{password}"
     b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
 
     session.headers.update({
         'Authorization': f'Basic {b64_auth}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0',
         'Accept': 'application/json'
     })
 
@@ -115,7 +146,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
     dataframes_sauvegardes = {}
 
     for index, (uid, nom_personnalise) in enumerate(mapping_favoris.items(), start=1):
-        print(f"\n--- Traitement du Favori {index}/{len(mapping_favoris)} [{nom_personnalise} | UID: {uid}] ---")
+        print(f"\n--- Traitement du Favori {index}/{len(mapping_favoris)} [{nom_personnalise}] ---")
 
         endpoints_donnees = {
             "Moteur Analytique Universel" : f"{base_url}/api/analytics.json?visualization={uid}",
@@ -131,15 +162,13 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
 
         for nom_route, url in endpoints_donnees.items():
             try:
-                print(f"  -> Requête envoyée via : {nom_route}. Calcul serveur en cours...")
+                print(f"  -> Requête via : {nom_route}...")
                 response = session.get(url, timeout=180, verify=False, auth=(username, password))
-
                 if response.status_code == 200:
                     donnees_json = response.json()
                     if 'rows' in donnees_json and len(donnees_json['rows']) > 0:
                         succes_donnees = True
                         nb_lignes = len(donnees_json['rows'])
-                        print(f"  [v] Extraction réussie ! {nb_lignes} lignes extraites.")
                         break
                 else:
                     derniere_erreur = f"Erreur HTTP {response.status_code}"
@@ -149,24 +178,22 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
 
         temps_fin = time.time()
         duree_minutes = round((temps_fin - temps_debut) / 60, 2)
-
-        statut_reussite = "yes" if succes_donnees else "no"
         rapport_extraction.append({
-            "Nom": nom_personnalise, "UID": uid, "Réussite": statut_reussite,
+            "Nom": nom_personnalise, "UID": uid, "Réussite": "yes" if succes_donnees else "no",
             "Temps": duree_minutes, "Lignes": nb_lignes, "Erreur": derniere_erreur
         })
 
         if not succes_donnees:
-            print(f"[X] ÉCHEC GLOBAL : Impossible d'extraire les données de '{nom_personnalise}'.")
             continue
 
-        # ÉTAPE 1 : Sauvegarde JSON brut
+        # Sauvegarde et Envoi JSON
         nom_fichier_json = f"{nom_personnalise}.json"
-        chemin_json = os.path.join(dossier_destination, nom_fichier_json)
+        chemin_json = os.path.join(dossier_local, nom_fichier_json)
         with open(chemin_json, 'w', encoding='utf-8') as f:
             json.dump(donnees_json, f, ensure_ascii=False, indent=4)
+        uploader_fichier_drive(drive_service, chemin_json, nom_fichier_json, id_session_drive)
 
-        # ÉTAPE 2 : Nettoyage et injection de la géographie textuelle
+        # Nettoyage et géographie
         try:
             colonnes = [h.get('column', h.get('name')) for h in donnees_json['headers']]
             lignes = donnees_json['rows']
@@ -191,69 +218,41 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
                     colonnes_geo = ['Province', 'Zone de Sante', 'UID Site', 'Nom du Site']
                     colonnes_a_exclure = set(colonnes_geo + ['organisationunitid', 'organisationunitname', 'organisationunitcode', 'organisationunitdescription', 'ou'])
                     autres_colonnes = [c for c in df.columns if c not in colonnes_a_exclure]
-
                     df = df[colonnes_geo + autres_colonnes]
 
-            # Sauvegarde du fichier individuel d'indicateur
             nom_fichier_excel = f"{nom_personnalise}.xlsx"
-            chemin_excel = os.path.join(dossier_destination, nom_fichier_excel)
+            chemin_excel = os.path.join(dossier_local, nom_fichier_excel)
             with pd.ExcelWriter(chemin_excel, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Données DQAT', index=False)
-            print(f"  [+] Fichier individuel créé : '{nom_fichier_excel}'")
-
+            
+            uploader_fichier_drive(drive_service, chemin_excel, nom_fichier_excel, id_session_drive)
             dataframes_sauvegardes[nom_personnalise] = df
 
         except Exception as err:
-            print(f"  [X] Erreur de traitement Excel sur {nom_personnalise} : {str(err)}")
+            print(f"  [X] Erreur Excel sur {nom_personnalise} : {str(err)}")
 
-    # --------------------------------------------------------------------------
-    # ÉTAPE 3 : CONSOLIDATION ET SÉCURISATION DU FICHIER UNIQUE MASTER
-    # --------------------------------------------------------------------------
-    print("\n" + "="*70)
-    print("  ÉTAPE 3 : COMPILATION MULTI-FEUILLES ET APPLICATION DU NETTOYAGE LOGIQUE")
-    print("="*70)
+    # Consolidation Master
+    print("\n====================================================================")
+    print("  ÉTAPE 3 : COMPILATION MULTI-FEUILLES MASTER")
+    print("====================================================================")
 
     ref_name = "DQAT_2025_Depistage_Pos"
-    statut_compil = "NON EXÉCUTÉE"
-    total_lignes_master = 0
-    colonnes_master_brutes = []
-    colonnes_master_nettoyees = []
-
     if ref_name in dataframes_sauvegardes:
-        print(f"[-] Initialisation de la matrice brute depuis la référence : {ref_name}")
         df_master = dataframes_sauvegardes[ref_name].copy()
-
         favoris_a_greffer = ["DQAT_2025_Depistage", "DQAT_2025_PEC", "DQAT_2025_PTME"]
         colonnes_gestion_doublons = ['Province', 'Zone de Sante', 'Nom du Site', 'periodname', 'periodcode', 'perioddescription', 'reporting_month_name', 'param_organisationunit_name', 'organisation_unit_is_parent', 'organisationunitname', 'A27']
 
         for cible in favoris_a_greffer:
             if cible in dataframes_sauvegardes:
-                df_cible = dataframes_sauvegardes[cible].copy()
-                df_cible = df_cible.drop_duplicates(subset=['UID Site', 'periodid'])
-
+                df_cible = dataframes_sauvegardes[cible].copy().drop_duplicates(subset=['UID Site', 'periodid'])
                 colonnes_indicateurs_propres = [c for c in df_cible.columns if c not in colonnes_gestion_doublons and c not in ['UID Site', 'periodid']]
-
                 if colonnes_indicateurs_propres:
                     df_cible_filtre = df_cible[['UID Site', 'periodid'] + colonnes_indicateurs_propres]
                     df_master = pd.merge(df_master, df_cible_filtre, on=['UID Site', 'periodid'], how='left')
 
-        colonnes_master_brutes = df_master.columns.tolist()
-        total_lignes_master = len(df_master)
-
-        # --------------------------------------------------------------------------
-        # COEUR DU MOTEUR DE NETTOYAGE LOCAL
-        # --------------------------------------------------------------------------
-        print("[-] Exécution de la feuille nettoyée en mémoire locale...")
         df_cleaned = df_master.copy()
-
         df_cleaned.columns = [c.strip() for c in df_cleaned.columns]
-
-        colonnes_a_supprimer = [
-            'periodcode', 'perioddescription', 'reporting_month_name',
-            'param_organisationunit_name', 'organisation_unit_is_parent',
-            'A27', 'PNLS_CU_4.7_FE VIH+ mises sous TARV SA/PP_y'
-        ]
-        df_cleaned = df_cleaned.drop(columns=[c for c in colonnes_a_supprimer if c in df_cleaned.columns], errors='ignore')
+        df_cleaned = df_cleaned.drop(columns=[c for c in ['periodcode', 'perioddescription', 'reporting_month_name', 'param_organisationunit_name', 'organisation_unit_is_parent', 'A27', 'PNLS_CU_4.7_FE VIH+ mises sous TARV SA/PP_y'] if c in df_cleaned.columns], errors='ignore')
 
         mapping_etape_1 = {
             "PNLS_CU_4.7_FE VIH+ informés résultats SA/PP": "TEMP_47_DIAGNOSTIQUEES",
@@ -265,7 +264,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
             "B114": "PNLS_CU_3.4.4_AZT/3TC +ATV/r"
         }
         df_cleaned = df_cleaned.rename(columns=mapping_etape_1)
-
+        
         mapping_etape_2 = {
             "TEMP_47_DIAGNOSTIQUEES": "PNLS_CU_4.7_Diagnostiquées VIH+ SA/PP",
             "TEMP_47_INFORMES": "PNLS_CU_4.7_FE VIH+ informés résultats SA/PP",
@@ -273,85 +272,40 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
             "TEMP_47_RETIRE": "PNLS_CU_4.7_FE retiré les résultats SA/PP"
         }
         df_cleaned = df_cleaned.rename(columns=mapping_etape_2)
-        colonnes_master_nettoyees = df_cleaned.columns.tolist()
 
-        # Sauvegarde du fichier Master Unique Multi-Feuilles
         nom_master_excel = "DQAT_2025_Compilation_Master.xlsx"
-        chemin_master_excel = os.path.join(dossier_destination, nom_master_excel)
-
+        chemin_master_excel = os.path.join(dossier_local, nom_master_excel)
         with pd.ExcelWriter(chemin_master_excel, engine='openpyxl') as writer:
             df_master.to_excel(writer, sheet_name='Compilation_Brute', index=False)
             df_cleaned.to_excel(writer, sheet_name='Compilation_Nettoyée', index=False)
+        
+        uploader_fichier_drive(drive_service, chemin_master_excel, nom_master_excel, id_session_drive)
 
-        print(f"[v] SUCCÈS ABSOLU : Le classeur multi-feuilles '{nom_master_excel}' a été généré avec succès.")
-        statut_compil = "OUI (Feuilles Brute & Nettoyée intégrées)"
-    else:
-        print("[X] ÉCHEC : Le fichier de référence dépistage positif est introuvable.")
-        statut_compil = "NON"
-
-    # --------------------------------------------------------------------------
-    # ÉTAPE 4 : CRÉATION DU FICHIER TEXTE DE RÉSUMÉ EXÉCUTIF
-    # --------------------------------------------------------------------------
-    print("\n[-] Étape 4 : Écriture du journal de validation technique...")
-    chemin_resume_txt = os.path.join(dossier_destination, "resume_extraction.txt")
-
+    # Résumé txt
+    chemin_resume_txt = os.path.join(dossier_local, "resume_extraction.txt")
     with open(chemin_resume_txt, 'w', encoding='utf-8') as f_txt:
-        f_txt.write("=====================================================================\n")
-        f_txt.write(f"      RÉSUMÉ D'EXTRACTION & RAPPORT MULTI-FEUILLES DQAT - V19         \n")
-        f_txt.write(f"      Date (Kinshasa) : {datetime.now(TZ_KINSHASA).strftime('%Y-%m-%d %H:%M:%S')}    \n")
-        f_txt.write("=====================================================================\n\n")
-
-        f_txt.write("--- PARTIE 1 : SÉCURISATION DES DOSSIERS DE SANTÉ (DHIS2 API) ---\n\n")
+        f_txt.write(f"RÉSUMÉ DQAT V19 - Date : {datetime.now(TZ_KINSHASA).strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         for r in rapport_extraction:
-            f_txt.write(f"Nom du favori      : {r['Nom']}\n")
-            f_txt.write(f"UID du favori      : {r['UID']}\n")
-            f_txt.write(f"Réussite           : {r['Réussite'].upper()}\n")
-            f_txt.write(f"Temps d'extraction : {r['Temps']} minute(s)\n")
-            f_txt.write(f"Nombre de lignes   : {r['Lignes']}\n")
-            f_txt.write(f"Erreur rencontrée  : {r['Erreur']}\n")
-            f_txt.write("-----------------------------------------------------\n")
-
-        f_txt.write("\n=====================================================================\n")
-        f_txt.write("  PARTIE 2 : ANALYSE DES COMPILATIONS LOCALES (HORS DHIS2)\n")
-        f_txt.write("=====================================================================\n")
-        f_txt.write("Classeur Unique Produit : DQAT_2025_Compilation_Master.xlsx\n")
-        f_txt.write(f"Squelette de référence  : {ref_name}\n")
-        f_txt.write("Clés de fusion strictes : ['UID Site', 'periodid']\n")
-        f_txt.write(f"Volume de lignes Master : {total_lignes_master} lignes (Stabilité 100%)\n\n")
-
-        f_txt.write("[ONGLET 1 : Compilation_Brute]\n")
-        f_txt.write(f"-> Nombre total d'en-têtes bruts : {len(colonnes_master_brutes)} colonnes d'origine\n\n")
-
-        f_txt.write("[ONGLET 2 : Compilation_Nettoyée]\n")
-        f_txt.write(f"-> Nombre total d'en-têtes épurés : {len(colonnes_master_nettoyees)} colonnes qualified\n")
-        f_txt.write("-> Actions de nettoyage appliquées avec succès :\n")
-        f_txt.write("   * Supprimer l'espace de texte sur tous les en-têtes (Trim/Strip)\n")
-        f_txt.write("   * Suppression de : periodcode, perioddescription, reporting_month_name,\n")
-        f_txt.write("                      param_organisationunit_name, organisation_unit_is_parent, A27\n")
-        f_txt.write("   * Élimination du doublon de fusion : PNLS_CU_4.7_FE VIH+ mises sous TARV SA/PP_y\n")
-        f_txt.write("   * Traduction médicale de : B14 -> PNLS_CU_3.4.4_AZT/3TC +ATV/r\n")
-        f_txt.write("   * Réalignement sémantique et inversion de la cascade de la section 4.7_FE\n\n")
-
-        f_txt.write("[NOMENCLATURE FINALE DES COLONNES NETTOYÉES]\n")
-        for idx, col in enumerate(colonnes_master_nettoyees, start=1):
-            f_txt.write(f"  En-tête {idx:02d} : {col}\n")
-
-        f_txt.write(f"\nCONSOLIDATION MULTI-FEUILLES ASSURÉE : {statut_compil.upper()}\n")
-        f_txt.write("=====================================================================\n")
-
-    print(f"[+] Journal résumé de validation sauvegardé avec succès.")
+            f_txt.write(f"Favori : {r['Nom']} | Réussite : {r['Réussite']} | Lignes : {r['Lignes']}\n")
+    uploader_fichier_drive(drive_service, chemin_resume_txt, "resume_extraction.txt", id_session_drive)
+    
     session.close()
 
 if __name__ == "__main__":
     URL_BASE_DHIS2 = "https://snisrdc.com"
 
     try:
-        dossier_session = initialiser_environnement()
+        drive_serv = initialiser_drive_service()
+        dossier_local, nom_session = initialiser_environnement_local()
+        
+        print(f"[-] Création du dossier de session sur Google Drive...")
+        id_session_drive = creer_dossier_drive(drive_serv, nom_session, ID_DOSSIER_RACINE_DRIVE)
+        
         nom_utilisateur, mot_de_passe = recuperer_identifiants()
-        extraire_et_convertir_favoris(URL_BASE_DHIS2, FAVORIS_MAPPING, nom_utilisateur, mot_de_passe, dossier_session)
+        extraire_et_convertir_favoris(URL_BASE_DHIS2, FAVORIS_MAPPING, nom_utilisateur, mot_de_passe, dossier_local, drive_serv, id_session_drive)
 
         print("\n====================================================================")
-        print("[+] FIN D'EXÉCUTION. LE CLASSEUR COMPILÉ ET NETTOYÉ EST ENREGISTRÉ.")
+        print("[+] TERMINÉ ! TOUS LES FICHIERS ONT ÉTÉ ENVOYÉS SUR GOOGLE DRIVE.")
         print("====================================================================")
     except Exception as e_main:
         print(f"\n[X] Le processus général a échoué : {str(e_main)}")
