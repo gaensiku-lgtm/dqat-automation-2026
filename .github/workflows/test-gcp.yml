@@ -31,4 +31,8 @@ jobs:
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Exécuter le script Python
+      env:
+        # On injecte ici les secrets DHIS2 pour que le script puisse s'y connecter
+        DHIS2_USERG: ${{ secrets.DHIS2_USERG }}
+        DHIS2_PASSWORDG: ${{ secrets.DHIS2_PASSWORDG }}
       run: python automation_dhis2_dqat_V19.py
