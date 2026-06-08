@@ -2,8 +2,8 @@ name: Automatisation Mensuelle Script V19
 
 on:
   schedule:
-    # S'exécute automatiquement le 1er de chaque mois à minuit UTC (1h ou 2h du matin en France)
-    - cron: '0 0 1 * *'
+    # S'exécute tous les 2 jours à 4h00 UTC (soit 5h00 du matin heure de Kinshasa)
+    - cron: '0 4 */2 * *'
   workflow_dispatch: # Garde le gros bouton manuel sur le site GitHub
 
 jobs:
