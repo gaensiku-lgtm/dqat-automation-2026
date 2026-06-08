@@ -1,6 +1,6 @@
 # ==============================================================================
 # SCRIPT AUTOMATISÉ DQAT - VERSION 19 (MOTEUR DE NETTOYAGE MULTI-FEUILLES)
-# Configuration : GitHub Actions avec Sauvegarde Directe Google Drive API
+# Configuration : GitHub Actions avec Envoi via Passerelle Google Apps Script
 # Zone Horaire : Afrique/Kinshasa (UTC+1)
 # ==============================================================================
 
@@ -13,19 +13,14 @@ import requests
 import pandas as pd
 import urllib3
 
-# Importations pour l'API Google Drive
-import google.auth
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
 # Désactivation des alertes de sécurité SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration du fuseau horaire de Kinshasa (UTC+1)
 TZ_KINSHASA = timezone(timedelta(hours=1))
 
-# ID de votre dossier Google Drive partagé
-ID_DOSSIER_RACINE_DRIVE = "1RMriGUzLVa_O1Cf28OUPTlF2Jl0QEXn-"
+# URL exacte de votre passerelle Google Apps Script
+URL_PASSERELLE = "https://script.google.com/macros/s/AKfycbycRM3Qa8IJW6X24IMsTbHOu_COW_T6aY6iYQcIefuKIg5x1lF987Xz8L_lhy5sJYzJYg/exec"
 
 # Dictionnaire officiel des favoris validés (UID PEC actualisé)
 FAVORIS_MAPPING = {
@@ -36,38 +31,33 @@ FAVORIS_MAPPING = {
     "eU2NiPPtbKv": "Suivi FA (6 derniers mois)"
 }
 
-def initialiser_drive_service():
+def uploader_via_passerelle(chemin_local, nom_fichier, nom_session):
     try:
-        # Authentification automatique via la clé GCP_SA_KEY configurée sur GitHub
-        creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
-        service = build('drive', 'v3', credentials=creds)
-        return service
+        with open(chemin_local, "rb") as f:
+            contenu_bytes = f.read()
+        contenu_b64 = base64.b64encode(contenu_bytes).decode('utf-8')
+
+        if chemin_local.endswith('.xlsx'):
+            mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        elif chemin_local.endswith('.json'):
+            mime = 'application/json'
+        else:
+            mime = 'text/plain'
+
+        payload = {
+            "nomSession": nom_session,
+            "nomFichier": nom_fichier,
+            "mimeType": mime,
+            "contenuFichier": contenu_b64
+        }
+
+        response = requests.post(URL_PASSERELLE, json=payload, timeout=60)
+        if response.status_code == 200:
+            print(f"  [➔] Transféré sur Google Drive : {nom_fichier}")
+        else:
+            print(f"  [X] Échec de l'envoi de {nom_fichier} (Code {response.status_code})")
     except Exception as e:
-        print(f"[X] Erreur d'initialisation de l'API Google Drive : {str(e)}")
-        raise e
-
-def creer_dossier_drive(service, nom_dossier, parent_id):
-    metadata = {
-        'name': nom_dossier,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [parent_id]
-    }
-    dossier = service.files().create(body=metadata, fields='id').execute()
-    return dossier.get('id')
-
-def uploader_fichier_drive(service, chemin_local, nom_fichier, dossier_destination_id):
-    metadata = {'name': nom_fichier, 'parents': [dossier_destination_id]}
-    
-    if chemin_local.endswith('.xlsx'):
-        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    elif chemin_local.endswith('.json'):
-        mime = 'application/json'
-    else:
-        mime = 'text/plain'
-        
-    media = MediaFileUpload(chemin_local, mimetype=mime, resumable=True)
-    service.files().create(body=metadata, media_body=media, fields='id').execute()
-    print(f"  [➔] Transféré sur Google Drive : {nom_fichier}")
+        print(f"  [X] Erreur de passerelle sur {nom_fichier} : {str(e)}")
 
 def initialiser_environnement_local():
     print("====================================================================")
@@ -131,7 +121,7 @@ def recuperer_metadonnees_geo_ciblees(session, base_url, liste_uids, username, p
             continue
     return mapping_geo
 
-def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password, dossier_local, drive_service, id_session_drive):
+def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password, dossier_local, nom_session):
     session = requests.Session()
     auth_str = f"{username}:{password}"
     b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
@@ -184,6 +174,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
         })
 
         if not succes_donnees:
+            print(f"  [X] Échec d'extraction pour ce favori.")
             continue
 
         # Sauvegarde et Envoi JSON
@@ -191,7 +182,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
         chemin_json = os.path.join(dossier_local, nom_fichier_json)
         with open(chemin_json, 'w', encoding='utf-8') as f:
             json.dump(donnees_json, f, ensure_ascii=False, indent=4)
-        uploader_fichier_drive(drive_service, chemin_json, nom_fichier_json, id_session_drive)
+        uploader_via_passerelle(chemin_json, nom_fichier_json, nom_session)
 
         # Nettoyage et géographie
         try:
@@ -225,7 +216,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
             with pd.ExcelWriter(chemin_excel, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Données DQAT', index=False)
             
-            uploader_fichier_drive(drive_service, chemin_excel, nom_fichier_excel, id_session_drive)
+            uploader_via_passerelle(chemin_excel, nom_fichier_excel, nom_session)
             dataframes_sauvegardes[nom_personnalise] = df
 
         except Exception as err:
@@ -279,7 +270,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
             df_master.to_excel(writer, sheet_name='Compilation_Brute', index=False)
             df_cleaned.to_excel(writer, sheet_name='Compilation_Nettoyée', index=False)
         
-        uploader_fichier_drive(drive_service, chemin_master_excel, nom_master_excel, id_session_drive)
+        uploader_via_passerelle(chemin_master_excel, nom_master_excel, nom_session)
 
     # Résumé txt
     chemin_resume_txt = os.path.join(dossier_local, "resume_extraction.txt")
@@ -287,7 +278,7 @@ def extraire_et_convertir_favoris(base_url, mapping_favoris, username, password,
         f_txt.write(f"RÉSUMÉ DQAT V19 - Date : {datetime.now(TZ_KINSHASA).strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         for r in rapport_extraction:
             f_txt.write(f"Favori : {r['Nom']} | Réussite : {r['Réussite']} | Lignes : {r['Lignes']}\n")
-    uploader_fichier_drive(drive_service, chemin_resume_txt, "resume_extraction.txt", id_session_drive)
+    uploader_via_passerelle(chemin_resume_txt, "resume_extraction.txt", nom_session)
     
     session.close()
 
@@ -295,14 +286,9 @@ if __name__ == "__main__":
     URL_BASE_DHIS2 = "https://snisrdc.com"
 
     try:
-        drive_serv = initialiser_drive_service()
         dossier_local, nom_session = initialiser_environnement_local()
-        
-        print(f"[-] Création du dossier de session sur Google Drive...")
-        id_session_drive = creer_dossier_drive(drive_serv, nom_session, ID_DOSSIER_RACINE_DRIVE)
-        
         nom_utilisateur, mot_de_passe = recuperer_identifiants()
-        extraire_et_convertir_favoris(URL_BASE_DHIS2, FAVORIS_MAPPING, nom_utilisateur, mot_de_passe, dossier_local, drive_serv, id_session_drive)
+        extraire_et_convertir_favoris(URL_BASE_DHIS2, FAVORIS_MAPPING, nom_utilisateur, mot_de_passe, dossier_local, nom_session)
 
         print("\n====================================================================")
         print("[+] TERMINÉ ! TOUS LES FICHIERS ONT ÉTÉ ENVOYÉS SUR GOOGLE DRIVE.")
